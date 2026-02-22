@@ -9,6 +9,7 @@ Transport: Streamable HTTP on port 8765
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -117,8 +118,11 @@ def get_countries() -> str:
     ]
     """
     df = _load_data()
-    # TODO: Implement - return unique country codes and names as JSON string
-    pass
+    return (
+        df.select(["countryiso3code", "country"])
+        .unique(maintain_order=False)
+        .write_json()
+    )
 
 
 @mcp.resource("data://indicators/{country_code}")
@@ -140,9 +144,10 @@ def get_country_indicators(country_code: str) -> str:
     Expected output: JSON array of indicator records for that country
     """
     df = _load_data()
-    # TODO: Implement - filter by country and return as JSON string
-    pass
-
+    df_filtered = df.filter(pl.col("countryiso3code") == country_code)
+    if df_filtered.is_empty():
+        raise ValueError(f"Country code '{country_code}' not found in dataset")
+    return df_filtered.write_json()
 
 # =============================================================================
 # PART 2: TOOLS (External APIs)
@@ -186,7 +191,28 @@ def get_country_info(country_code: str) -> dict:
     """
     logger.info(f"Fetching country info for: {country_code}")
     # TODO: Implement using _fetch_rest_countries()
-    pass
+    try:
+        data = _fetch_rest_countries(country_code)
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
+        logger.exception("Failed to fetch country info for %s", country_code)
+        return {"country_code": country_code, "error": str(e)}
+
+    languages = data.get("languages") or {}
+    currencies = data.get("currencies") or {}
+    capital = data.get("capital") or []
+ 
+    return {
+         "name": data.get("name", {}).get("common"),
+         "capital": capital[0] if capital else None,
+         "region": data.get("region"),
+         "subregion": data.get("subregion"),
+         "languages": list(languages.values()),
+         "currencies": list(currencies.keys()),
+         "population": data.get("population"),
+         "flag": data.get("flag"),
+     }
+ 
+
 
 
 @mcp.tool()
@@ -227,7 +253,36 @@ def get_live_indicator(
     """
     logger.info(f"Fetching {indicator} for {country_code} in {year}")
     # TODO: Implement using _fetch_world_bank_indicator()
-    pass
+    try:
+        data = _fetch_world_bank_indicator(country_code, indicator, year)
+    except (httpx.HTTPError) as e:
+        logger.exception("Failed to fetch World Bank indicator data for %s", country_code)
+        return {
+            "country": country_code,
+            "indicator": indicator,
+            "year": year,
+            "value": None,
+            "error": str(e),
+        }
+    if not data:
+        return {
+            "country": country_code,
+            "indicator": indicator,
+            "year": year,
+            "value": None,
+            "error": f"No data found for {indicator} in {country_code} for year {year}",
+        }
+    entry = next((item for item in data if item.get("date") == str(year)), None)
+    record = entry if entry else data[0]
+    return {
+        "country": record.get("country", {}).get("id"),
+        "country_name": record.get("country", {}).get("value"),
+        "indicator": record.get("indicator", {}).get("id"),
+            "indicator_name": record.get("indicator", {}).get("value"),
+            "year": record.get("date"),
+            "value": record.get("value"),
+        }
+    
 
 
 @mcp.tool()
@@ -260,8 +315,32 @@ def compare_countries(
     - Handle errors for individual countries (don't fail the whole request)
     """
     logger.info(f"Comparing {indicator} for countries: {country_codes}")
-    # TODO: Implement - call get_live_indicator for each country
-    pass
+    if not country_codes:
+        return []
+
+    results_by_index: dict[int, dict] = {}
+    max_workers = min(32, len(country_codes))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_item = {
+            executor.submit(get_live_indicator, code, indicator, year): (idx, code)
+            for idx, code in enumerate(country_codes)
+        }
+        for future in as_completed(future_to_item):
+            idx, code = future_to_item[future]
+            try:
+                results_by_index[idx] = future.result()
+            except Exception as e:
+                logger.exception("Failed comparing indicator for %s", code)
+                results_by_index[idx] = {
+                    "country": code,
+                    "indicator": indicator,
+                    "year": year,
+                    "value": None,
+                    "error": str(e),
+                }
+
+    return [results_by_index[i] for i in range(len(country_codes))]
 
 
 # =============================================================================
